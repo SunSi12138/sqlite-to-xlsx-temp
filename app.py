@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import sqlite3
@@ -34,12 +35,36 @@ def unique_sheet_name(raw_name: str, used: set[str], part: int = 1) -> str:
     return candidate
 
 
+def decode_json_unicode(value: str) -> str:
+    """Decode JSON-style \uXXXX escapes only when the whole cell is valid JSON."""
+    if "\\u" not in value and "\\U" not in value:
+        return value
+
+    stripped = value.strip()
+    if not stripped or stripped[0] not in '{["':
+        return value
+
+    try:
+        parsed = json.loads(value)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return value
+
+    if isinstance(parsed, str):
+        return parsed
+
+    if isinstance(parsed, (dict, list)):
+        return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+
+    return value
+
+
 def normalize_value(value):
     if value is None:
         return None
     if isinstance(value, bytes):
         return value.hex().upper()
     if isinstance(value, str):
+        value = decode_json_unicode(value)
         return value[:EXCEL_MAX_CELL_CHARS]
     return value
 
