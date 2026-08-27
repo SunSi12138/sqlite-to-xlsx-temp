@@ -1,257 +1,324 @@
-import json
+from __future__ import annotations
+
 import os
-import re
-import sqlite3
-import threading
-import traceback
+import sys
 from pathlib import Path
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
 
-import xlsxwriter
+import numpy as np
+import parselmouth
+from PySide6.QtCore import Qt, QThread, Signal, QUrl
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QPainter, QPainterPath, QPen
+from PySide6.QtWidgets import QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton, QProgressBar, QSlider, QVBoxLayout, QWidget
 
-EXCEL_MAX_ROWS = 1_048_576
-DATA_ROWS_PER_SHEET = EXCEL_MAX_ROWS - 1
-EXCEL_MAX_CELL_CHARS = 32_767
-INVALID_SHEET_CHARS = re.compile(r"[\[\]:*?/\\]")
+from audio_core import ProcessResult, process_vocals
 
+APP_NAME = "AutoVocal Prototype"
 
-def quote_identifier(name: str) -> str:
-    return '"' + name.replace('"', '""') + '"'
+class WaveformWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(78)
+        self._peaks = np.zeros(120, dtype=float)
 
-
-def unique_sheet_name(raw_name: str, used: set[str], part: int = 1) -> str:
-    cleaned = INVALID_SHEET_CHARS.sub("_", raw_name).strip("'") or "Sheet"
-    suffix = "" if part == 1 else f"_{part}"
-    max_base = 31 - len(suffix)
-    base = cleaned[:max_base]
-    candidate = base + suffix
-    counter = 2
-    while candidate.casefold() in used:
-        extra = f"_{counter}"
-        candidate = base[: 31 - len(suffix) - len(extra)] + suffix + extra
-        counter += 1
-    used.add(candidate.casefold())
-    return candidate
-
-
-def decode_json_unicode(value: str) -> str:
-    """Decode JSON-style Unicode escape sequences only when the cell is valid JSON."""
-    if "\\u" not in value and "\\U" not in value:
-        return value
-
-    stripped = value.strip()
-    if not stripped or stripped[0] not in '{["':
-        return value
-
-    try:
-        parsed = json.loads(value)
-    except (json.JSONDecodeError, TypeError, ValueError):
-        return value
-
-    if isinstance(parsed, str):
-        return parsed
-
-    if isinstance(parsed, (dict, list)):
-        return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
-
-    return value
-
-
-def normalize_value(value):
-    if value is None:
-        return None
-    if isinstance(value, bytes):
-        return value.hex().upper()
-    if isinstance(value, str):
-        value = decode_json_unicode(value)
-        return value[:EXCEL_MAX_CELL_CHARS]
-    return value
-
-
-def export_database(db_path: Path) -> Path:
-    output_path = db_path.with_suffix(".xlsx")
-    temp_path = output_path.with_name(output_path.name + ".tmp")
-
-    if temp_path.exists():
-        temp_path.unlink()
-
-    conn = sqlite3.connect(str(db_path))
-    conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
-
-    workbook = xlsxwriter.Workbook(
-        str(temp_path),
-        {
-            "constant_memory": True,
-            "strings_to_formulas": False,
-            "strings_to_urls": False,
-        },
-    )
-
-    used_sheet_names: set[str] = set()
-    header_format = workbook.add_format({"bold": True})
-
-    try:
-        tables = [
-            row[0]
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master "
-                "WHERE type='table' AND name NOT LIKE 'sqlite_%' "
-                "ORDER BY name"
-            )
-        ]
-
-        if not tables:
-            ws = workbook.add_worksheet("Info")
-            ws.write(0, 0, "No user tables found in this SQLite database.")
-
-        for table_name in tables:
-            cursor = conn.execute(f"SELECT * FROM {quote_identifier(table_name)}")
-            headers = [col[0] for col in cursor.description]
-            part = 1
-            worksheet = None
-            excel_row = 0
-
-            def start_sheet(current_part: int):
-                nonlocal excel_row
-                sheet_name = unique_sheet_name(table_name, used_sheet_names, current_part)
-                ws = workbook.add_worksheet(sheet_name)
-                for col_idx, header in enumerate(headers):
-                    ws.write(0, col_idx, str(header), header_format)
-                ws.freeze_panes(1, 0)
-                excel_row = 1
-                return ws
-
-            worksheet = start_sheet(part)
-
-            while True:
-                rows = cursor.fetchmany(5000)
-                if not rows:
-                    break
-
-                for row in rows:
-                    if excel_row >= EXCEL_MAX_ROWS:
-                        part += 1
-                        worksheet = start_sheet(part)
-
-                    for col_idx, value in enumerate(row):
-                        value = normalize_value(value)
-                        if value is None:
-                            continue
-                        worksheet.write(excel_row, col_idx, value)
-                    excel_row += 1
-
-        workbook.close()
-        workbook = None
-        conn.close()
-        conn = None
-        os.replace(temp_path, output_path)
-        return output_path
-
-    except Exception:
-        if workbook is not None:
-            try:
-                workbook.close()
-            except Exception:
-                pass
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
-        try:
-            if temp_path.exists():
-                temp_path.unlink()
-        except Exception:
-            pass
-        raise
-
-
-class ExportApp:
-    def __init__(self):
-        self.root = tk.Tk()
-        self.root.title("SQLite → XLSX")
-        self.root.geometry("520x165")
-        self.root.resizable(False, False)
-
-        frame = ttk.Frame(self.root, padding=18)
-        frame.pack(fill="both", expand=True)
-
-        ttk.Label(frame, text="SQLite → XLSX", font=("Segoe UI", 14, "bold")).pack(anchor="w")
-        self.status = tk.StringVar(value="请选择 SQLite 数据库文件")
-        ttk.Label(frame, textvariable=self.status, wraplength=480).pack(anchor="w", pady=(12, 8))
-
-        self.progress = ttk.Progressbar(frame, mode="indeterminate")
-        self.progress.pack(fill="x", pady=(0, 10))
-
-        self.choose_button = ttk.Button(frame, text="选择数据库并导出", command=self.choose_files)
-        self.choose_button.pack(anchor="e")
-
-        self.root.after(100, self.choose_files)
-
-    def choose_files(self):
-        files = filedialog.askopenfilenames(
-            title="选择 SQLite 数据库",
-            filetypes=[
-                ("SQLite 数据库", "*.db *.sqlite *.sqlite3"),
-                ("所有文件", "*.*"),
-            ],
-        )
-        if not files:
+    def set_audio(self, path: str | None) -> None:
+        if not path:
+            self._peaks = np.zeros(120, dtype=float)
+            self.update()
             return
+        try:
+            sound = parselmouth.Sound(path)
+            data = sound.values.mean(axis=0).astype(float)
+            if len(data) == 0:
+                raise ValueError
+            bins = 120
+            edges = np.linspace(0, len(data), bins + 1, dtype=int)
+            peaks = []
+            for a, b in zip(edges[:-1], edges[1:]):
+                seg = data[a:b]
+                peaks.append(float(np.max(np.abs(seg))) if len(seg) else 0.0)
+            arr = np.asarray(peaks)
+            scale = np.percentile(arr, 95) if np.any(arr) else 1.0
+            self._peaks = np.clip(arr / max(scale, 1e-8), 0.0, 1.0)
+        except Exception:
+            self._peaks = np.zeros(120, dtype=float)
+        self.update()
 
-        self.choose_button.config(state="disabled")
-        self.progress.start(12)
-        paths = [Path(p) for p in files]
-        threading.Thread(target=self.run_export, args=(paths,), daemon=True).start()
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        mid = h / 2.0
+        painter.setPen(QPen(QColor("#7C8CFF"), 1.5))
+        step = w / len(self._peaks)
+        path = QPainterPath()
+        for i, p in enumerate(self._peaks):
+            x = i * step + step / 2
+            amp = max(1.0, p * h * 0.38)
+            path.moveTo(x, mid - amp)
+            path.lineTo(x, mid + amp)
+        painter.drawPath(path)
 
-    def run_export(self, paths: list[Path]):
-        successes = []
-        failures = []
+class AudioCard(QFrame):
+    file_changed = Signal(str)
 
-        for index, path in enumerate(paths, start=1):
-            self.root.after(
-                0,
-                lambda i=index, n=len(paths), p=path: self.status.set(
-                    f"正在导出 {i}/{n}: {p.name}"
-                ),
-            )
-            try:
-                output = export_database(path)
-                successes.append(output)
-            except Exception as exc:
-                failures.append((path, exc, traceback.format_exc()))
+    def __init__(self, title: str, subtitle: str, parent=None):
+        super().__init__(parent)
+        self.setObjectName("audioCard")
+        self.setAcceptDrops(True)
+        self.path = ""
+        root = QVBoxLayout(self)
+        root.setContentsMargins(22, 20, 22, 18)
+        root.setSpacing(9)
+        top = QHBoxLayout()
+        text = QVBoxLayout()
+        title_label = QLabel(title)
+        title_label.setObjectName("cardTitle")
+        subtitle_label = QLabel(subtitle)
+        subtitle_label.setObjectName("muted")
+        text.addWidget(title_label)
+        text.addWidget(subtitle_label)
+        top.addLayout(text)
+        top.addStretch()
+        self.button = QPushButton("选择 WAV")
+        self.button.setObjectName("secondaryButton")
+        self.button.clicked.connect(self.browse)
+        top.addWidget(self.button)
+        root.addLayout(top)
+        self.filename = QLabel("拖入文件，或点击右上角选择")
+        self.filename.setObjectName("filename")
+        root.addWidget(self.filename)
+        self.waveform = WaveformWidget()
+        root.addWidget(self.waveform)
 
-        self.root.after(0, lambda: self.finish(successes, failures))
+    def browse(self):
+        path, _ = QFileDialog.getOpenFileName(self, "选择人声文件", "", "WAV Audio (*.wav);;All files (*.*)")
+        if path:
+            self.set_file(path)
 
-    def finish(self, successes, failures):
-        self.progress.stop()
-        self.choose_button.config(state="normal")
+    def set_file(self, path: str):
+        self.path = path
+        self.filename.setText(Path(path).name)
+        self.filename.setToolTip(path)
+        self.waveform.set_audio(path)
+        self.file_changed.emit(path)
 
-        if failures:
-            lines = []
-            if successes:
-                lines.append(f"成功导出 {len(successes)} 个数据库。")
-            lines.append(f"失败 {len(failures)} 个：")
-            for path, exc, _ in failures[:8]:
-                lines.append(f"- {path.name}: {exc}")
-            if len(failures) > 8:
-                lines.append("……")
-            self.status.set("导出完成，但有失败项目")
-            messagebox.showerror("导出结果", "\n".join(lines))
-        else:
-            self.status.set(f"完成：已导出 {len(successes)} 个 XLSX")
-            output_lines = "\n".join(str(p) for p in successes[:10])
-            if len(successes) > 10:
-                output_lines += "\n……"
-            messagebox.showinfo(
-                "导出完成",
-                f"已成功导出 {len(successes)} 个数据库。\n\n文件保存在数据库同级目录：\n{output_lines}",
-            )
+    def dragEnterEvent(self, event):
+        urls = event.mimeData().urls()
+        if urls and urls[0].toLocalFile().lower().endswith(".wav"):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        urls = event.mimeData().urls()
+        if urls:
+            self.set_file(urls[0].toLocalFile())
+            event.acceptProposedAction()
+
+class SliderRow(QWidget):
+    def __init__(self, title: str, description: str, value: int, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        top = QHBoxLayout()
+        labels = QVBoxLayout()
+        title_label = QLabel(title)
+        title_label.setObjectName("controlTitle")
+        desc = QLabel(description)
+        desc.setObjectName("muted")
+        labels.addWidget(title_label)
+        labels.addWidget(desc)
+        top.addLayout(labels)
+        top.addStretch()
+        self.value_label = QLabel(f"{value}%")
+        self.value_label.setObjectName("valuePill")
+        top.addWidget(self.value_label)
+        layout.addLayout(top)
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setRange(0, 100)
+        self.slider.setValue(value)
+        self.slider.valueChanged.connect(lambda v: self.value_label.setText(f"{v}%"))
+        layout.addWidget(self.slider)
+
+class Worker(QThread):
+    progress = Signal(int, str)
+    done = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, reference: str, user: str, output: str, strength: float, expression: float):
+        super().__init__()
+        self.reference = reference
+        self.user = user
+        self.output = output
+        self.strength = strength
+        self.expression = expression
 
     def run(self):
-        self.root.mainloop()
+        try:
+            result = process_vocals(self.reference, self.user, self.output, strength=self.strength, expression_keep=self.expression, progress=lambda value, text: self.progress.emit(value, text))
+            self.done.emit(result)
+        except Exception as exc:
+            self.failed.emit(str(exc))
 
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.worker: Worker | None = None
+        self.output_path = ""
+        self.setWindowTitle(APP_NAME)
+        self.resize(1120, 820)
+        self.setMinimumSize(940, 720)
+        central = QWidget()
+        central.setObjectName("root")
+        self.setCentralWidget(central)
+        outer = QVBoxLayout(central)
+        outer.setContentsMargins(38, 30, 38, 30)
+        outer.setSpacing(22)
+        header = QHBoxLayout()
+        brand = QVBoxLayout()
+        title = QLabel("AutoVocal")
+        title.setObjectName("heroTitle")
+        subtitle = QLabel("Reference-based vocal correction · Portable prototype")
+        subtitle.setObjectName("heroSubtitle")
+        brand.addWidget(title)
+        brand.addWidget(subtitle)
+        header.addLayout(brand)
+        header.addStretch()
+        badge = QLabel("V0 · OFFLINE")
+        badge.setObjectName("badge")
+        header.addWidget(badge)
+        outer.addLayout(header)
+        intro = QLabel("用一条唱准的参考人声，把你的音高自动拉向参考旋律，同时尽量保留自己的音域与颤音。当前版本专注干净的单人声 WAV。")
+        intro.setWordWrap(True)
+        intro.setObjectName("intro")
+        outer.addWidget(intro)
+        cards = QHBoxLayout()
+        cards.setSpacing(16)
+        self.reference_card = AudioCard("① 参考人声", "Reference vocal · 唱准的版本")
+        self.user_card = AudioCard("② 你的演唱", "User vocal · 要修正的版本")
+        cards.addWidget(self.reference_card, 1)
+        cards.addWidget(self.user_card, 1)
+        outer.addLayout(cards)
+        controls_frame = QFrame()
+        controls_frame.setObjectName("panel")
+        controls = QVBoxLayout(controls_frame)
+        controls.setContentsMargins(24, 22, 24, 22)
+        controls.setSpacing(20)
+        controls_title = QLabel("修音参数")
+        controls_title.setObjectName("sectionTitle")
+        controls.addWidget(controls_title)
+        self.strength = SliderRow("修音强度", "0% 保持原唱法，100% 最大程度贴近参考音高", 82)
+        self.expression = SliderRow("保留颤音 / 表情", "保留你原本的细微 pitch movement，数值越高越自然", 72)
+        controls.addWidget(self.strength)
+        controls.addWidget(self.expression)
+        outer.addWidget(controls_frame)
+        status_frame = QFrame()
+        status_frame.setObjectName("statusPanel")
+        status_layout = QHBoxLayout(status_frame)
+        status_layout.setContentsMargins(20, 16, 20, 16)
+        left = QVBoxLayout()
+        self.status = QLabel("准备就绪")
+        self.status.setObjectName("statusText")
+        self.detail = QLabel("建议先用 10–30 秒、无伴奏、单人声 WAV 验证效果。")
+        self.detail.setObjectName("muted")
+        left.addWidget(self.status)
+        left.addWidget(self.detail)
+        status_layout.addLayout(left, 2)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setTextVisible(False)
+        status_layout.addWidget(self.progress, 2)
+        outer.addWidget(status_frame)
+        actions = QHBoxLayout()
+        self.open_button = QPushButton("打开输出")
+        self.open_button.setObjectName("secondaryButton")
+        self.open_button.setEnabled(False)
+        self.open_button.clicked.connect(self.open_output)
+        actions.addWidget(self.open_button)
+        actions.addStretch()
+        self.run_button = QPushButton("开始自动修音  →")
+        self.run_button.setObjectName("primaryButton")
+        self.run_button.clicked.connect(self.start_processing)
+        actions.addWidget(self.run_button)
+        outer.addLayout(actions)
+        self.setStyleSheet(STYLE)
+
+    def start_processing(self):
+        ref = self.reference_card.path
+        user = self.user_card.path
+        if not ref or not user:
+            QMessageBox.warning(self, "缺少文件", "请先选择参考人声和你的演唱两个 WAV 文件。")
+            return
+        user_path = Path(user)
+        output = str(user_path.with_name(user_path.stem + "_autovocal.wav"))
+        self.output_path = output
+        self.run_button.setEnabled(False)
+        self.open_button.setEnabled(False)
+        self.progress.setValue(2)
+        self.status.setText("正在启动分析…")
+        self.detail.setText("处理中请不要关闭窗口。")
+        self.worker = Worker(ref, user, output, self.strength.slider.value() / 100.0, self.expression.slider.value() / 100.0)
+        self.worker.progress.connect(self.on_progress)
+        self.worker.done.connect(self.on_done)
+        self.worker.failed.connect(self.on_failed)
+        self.worker.start()
+
+    def on_progress(self, value: int, text: str):
+        self.progress.setValue(value)
+        self.status.setText(text)
+
+    def on_done(self, result: ProcessResult):
+        self.run_button.setEnabled(True)
+        self.open_button.setEnabled(True)
+        self.progress.setValue(100)
+        self.status.setText("修音完成")
+        self.detail.setText(f"平均修正 {result.mean_abs_correction_cents:.0f} cents · 有效帧 {result.voiced_frames} · {result.duration_seconds:.1f}s")
+
+    def on_failed(self, message: str):
+        self.run_button.setEnabled(True)
+        self.progress.setValue(0)
+        self.status.setText("处理失败")
+        self.detail.setText(message)
+        QMessageBox.critical(self, "AutoVocal", message)
+
+    def open_output(self):
+        if self.output_path and os.path.exists(self.output_path):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self.output_path))
+
+STYLE = r"""
+#root { background: #0B0D13; color: #F5F7FF; }
+QLabel { color: #F5F7FF; }
+#heroTitle { font-size: 34px; font-weight: 800; letter-spacing: -1px; }
+#heroSubtitle, #muted { color: #8F97AA; font-size: 12px; }
+#intro { color: #C5C9D6; font-size: 14px; padding: 2px 0 4px 0; }
+#badge { color: #B7C0FF; background: #181D33; border: 1px solid #2A3154; border-radius: 12px; padding: 8px 12px; font-weight: 700; font-size: 11px; }
+#audioCard, #panel, #statusPanel { background: #11141D; border: 1px solid #202431; border-radius: 18px; }
+#audioCard:hover { border: 1px solid #39416B; background: #131722; }
+#cardTitle, #sectionTitle { font-size: 16px; font-weight: 700; }
+#controlTitle, #statusText { font-size: 14px; font-weight: 650; }
+#filename { background: #0C0F16; border: 1px solid #1D2230; border-radius: 10px; padding: 9px 11px; color: #C7CCDA; font-family: Consolas, monospace; font-size: 11px; }
+#valuePill { color: #D9DEFF; background: #22294A; border-radius: 10px; padding: 6px 10px; min-width: 44px; font-weight: 700; }
+QPushButton { border: none; border-radius: 11px; padding: 11px 17px; font-weight: 700; }
+#primaryButton { background: #7282FF; color: white; min-width: 190px; padding: 14px 20px; font-size: 14px; }
+#primaryButton:hover { background: #8190FF; }
+#primaryButton:disabled { background: #34394D; color: #767D90; }
+#secondaryButton { background: #1A1E2A; color: #D9DCE7; border: 1px solid #2A3040; }
+#secondaryButton:hover { background: #222838; }
+#secondaryButton:disabled { color: #5E6472; background: #141720; }
+QSlider::groove:horizontal { height: 6px; background: #242938; border-radius: 3px; }
+QSlider::sub-page:horizontal { background: #7282FF; border-radius: 3px; }
+QSlider::handle:horizontal { width: 18px; height: 18px; margin: -6px 0; border-radius: 9px; background: #EEF0FF; border: 3px solid #7282FF; }
+QProgressBar { background: #202431; border: none; border-radius: 4px; height: 8px; }
+QProgressBar::chunk { background: #7282FF; border-radius: 4px; }
+"""
+
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    app.setFont(QFont("Segoe UI", 10))
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
 
 if __name__ == "__main__":
-    ExportApp().run()
+    main()
