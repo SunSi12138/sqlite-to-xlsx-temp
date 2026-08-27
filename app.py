@@ -36,7 +36,7 @@ def unique_sheet_name(raw_name: str, used: set[str], part: int = 1) -> str:
 
 
 def decode_json_unicode(value: str) -> str:
-    """Decode JSON-style \uXXXX escapes only when the whole cell is valid JSON."""
+    """Decode JSON-style Unicode escape sequences only when the cell is valid JSON."""
     if "\\u" not in value and "\\U" not in value:
         return value
 
