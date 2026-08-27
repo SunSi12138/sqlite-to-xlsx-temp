@@ -8,8 +8,16 @@ from app import export_database
 with tempfile.TemporaryDirectory() as tmp:
     db = Path(tmp) / "unicode-test.db"
     conn = sqlite3.connect(db)
-    conn.execute('CREATE TABLE "测试表" (id INTEGER, text_value TEXT, blob_value BLOB)')
-    conn.execute('INSERT INTO "测试表" VALUES (?, ?, ?)', (1, "中文🙂 UTF-8", b"\x00\xff"))
+    conn.execute('CREATE TABLE "测试表" (id INTEGER, text_value TEXT, json_value TEXT, blob_value BLOB)')
+    conn.execute(
+        'INSERT INTO "测试表" VALUES (?, ?, ?, ?)',
+        (
+            1,
+            "中文🙂 UTF-8",
+            '{"name":"\\u4e2d\\u6587","emoji":"\\ud83d\\ude42"}',
+            b"\x00\xff",
+        ),
+    )
     conn.commit()
     conn.close()
 
@@ -23,6 +31,8 @@ with tempfile.TemporaryDirectory() as tmp:
             if name.endswith(".xml")
         )
         assert "中文".encode("utf-8") in xml, "Unicode text missing from XLSX"
+        assert "🙂".encode("utf-8") in xml, "JSON Unicode emoji missing from XLSX"
+        assert b"\\u4e2d\\u6587" not in xml, "JSON Unicode escape was not decoded"
         assert b"00FF" in xml, "BLOB hex text missing from XLSX"
 
 print("Smoke test passed")
